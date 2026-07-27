@@ -6,7 +6,7 @@
 #include <complex>
 #include <vector>
 #include <random>
-#include <gsl/gsl_cblas.h>
+#include <mkl_cblas.h>
 
 using namespace std;
 using dcomplex = complex<double>;
@@ -15,8 +15,15 @@ using dcomplex = complex<double>;
 // Matrix Utility //
 ////////////////////
 
+extern "C" {
+    void dgetrf_(const int *m, const int *n, double * A, const int *lda, int * ipiv, int *info);
+    void dgetri_(const int* n, double* A, const int* lda, int* ipiv, double* work, int* lwork, int* info);
+    void zgetrf_(const int *m, const int *n, dcomplex * A, const int *lda, int * ipiv, int *info);
+    void zgetri_(const int* n, dcomplex* A, const int* lda, int* ipiv, dcomplex* work, int* lwork, int* info);
+}
+
 template<typename T>
-class Matrix
+class Matrix // row-major matrix
 {
 	std::vector<T> mat;
 	int rowN, colN;
@@ -172,10 +179,17 @@ public:
     template<typename U>
     friend Matrix operator-(const U& num, Matrix ref) {
         for(int i=0;i<ref.Nr()*ref.Nc();i++){
-            ref[i] = ref[i] - num;
+            ref[i] = num - ref[i];
         }
         return ref;
     }
+
+	friend Matrix operator-(Matrix ref) {
+		for(int i=0;i<ref.Nr()*ref.Nc();i++){
+			ref[i] = -ref[i];
+		}		
+		return ref;
+	}
 
     template<typename U>
 	Matrix operator*(const U& num) const {
@@ -295,6 +309,58 @@ public:
 		return C;
 	}
 
+	dcomplex det()
+    {
+        const int m = rowN, n = colN, l = std::min(m,n);
+        int ipiv[l], info;
+        std::vector<dcomplex> A = mat;
+
+        zgetrf_(&n,&m,&A[0],&n,&ipiv[0],&info);
+
+        int detP = 1;
+        for (int i=0;i<l;++i){
+            if (i+1 != ipiv[i])
+                detP = -detP;
+        }
+
+        dcomplex detU = dcomplex(1.0,0);
+        for (int i=0;i<l;++i){
+            detU *= A[i*m+i];
+        }
+
+        return dcomplex(detP,0)*detU;
+    }
+
+	void complex_inverse()
+    {
+        int N = std::min(rowN,colN);
+        int *IPIV = new int[N];
+        int LWORK = N*N;
+        dcomplex *WORK = new dcomplex[LWORK];
+        int INFO;
+
+        zgetrf_(&N,&N,&mat[0],&N,IPIV,&INFO);
+        zgetri_(&N,&mat[0],&N,IPIV,WORK,&LWORK,&INFO);
+
+        delete[] IPIV;
+        delete[] WORK;
+    }
+
+    void double_inverse()
+    {
+        int N = std::min(rowN,colN);
+        int *IPIV = new int[N];
+        int LWORK = N*N;
+        double *WORK = new double[LWORK];
+        int INFO;
+
+        dgetrf_(&N,&N,&mat[0],&N,IPIV,&INFO);
+        dgetri_(&N,&mat[0],&N,IPIV,WORK,&LWORK,&INFO);
+
+        delete[] IPIV;
+        delete[] WORK;
+    }
+
 	Matrix& minus() 
 	{
 		for(int i=0;i<rowN*colN;i++) mat[i] *= -1.0;
@@ -308,6 +374,18 @@ public:
 		}
 		return *this;
 	}
+
+	Matrix conj() const {
+        Matrix temp(rowN,colN);
+
+        for (int i=0; i<rowN; i++){
+			for (int j=0; j<colN; j++){
+				temp(i,j) = std::conj(mat[i*colN+j]);
+			}
+		}
+
+		return temp;
+    }
 
 	Matrix transpose() const {
 		Matrix temp(colN,rowN);
@@ -397,6 +475,22 @@ public:
 		for(int i=ri;i<rf;i++)
 		for(int j=ci;j<cf;j++)
 			A(i-ri,j-ci) = mat[i*colN+j];
+	}
+
+	Matrix kron(const Matrix& rhs) const // return : this (X) rhs
+	{
+		int new_rowN = rowN*rhs.Nr(), new_colN = colN*rhs.Nc();
+		Matrix temp(new_rowN,new_colN);
+		for (int i=0;i<new_rowN;++i){
+			int supi = i/rhs.Nr();
+			int subi = i%rhs.Nr();
+			for (int j=0;j<new_colN;++j){
+				int supj = j/rhs.Nc();
+				int subj = j%rhs.Nc();
+				temp(i,j) = mat[supi*colN+supj]*rhs(subi,subj);
+			}
+		}
+		return temp;
 	}
 
 	void view_mat(int ri, int rf, int ci, int cf)

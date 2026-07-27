@@ -1409,5 +1409,782 @@ public:
     }
 };
 
+template <typename EIGEN, typename PROFILE>
+class ChernNumber
+{
+    EIGEN Eigen;
+    const int Ngrid, L, L2;
+    std::vector<double> k_x, k_y;
+    const double dk_x, dk_y, RBZarea;
+    std::vector<MatrixC> list_eigenvec;
+    
+    void set_list_eigenvec()
+    {
+        const bool IsNotDev = true, IsTranspose = false;
+
+        for(int i=0;i<Ngrid*Ngrid;i++){
+            int x = i%Ngrid;
+            int y = (int)(i/Ngrid);
+
+            MatrixC Psi_T(L); double E[L];
+            Eigen.Single(k_x[x],k_y[y],E,Psi_T,'V',IsNotDev,IsTranspose);
+
+            list_eigenvec[i] = Psi_T;
+        }
+    }
+
+    dcomplex berry_connection(const int i1, const int i2, const int n, const int m)
+    {
+        MatrixC Psi1_T(m-n,L), Psi2(L,m-n);
+        list_eigenvec[i1].pull_Block(Psi1_T,n,m,0,L);
+        (list_eigenvec[i2].Hermitian_transpose()).pull_Block(Psi2,0,L,n,m);
+
+        MatrixC NonAbelBC = Psi1_T.zgemm(1.0,Psi2);
+
+        return NonAbelBC.det(); 
+    }
+public:
+    ChernNumber(const EIGEN &eigen, const int size, const int Ngrid):
+    Eigen(eigen),
+    Ngrid(Ngrid),
+    L(size), L2(size*2),
+    RBZarea(M_PI*M_PI*PROFILE::RBZ_x*PROFILE::RBZ_y),
+    dk_x(M_PI/((double)Ngrid)*PROFILE::RBZ_x),
+    dk_y(M_PI/((double)Ngrid)*PROFILE::RBZ_y)
+    {
+        k_x.resize(Ngrid);
+        k_y.resize(Ngrid);
+        list_eigenvec.resize(Ngrid*Ngrid,MatrixC(L));
+
+        for(int i=0;i<Ngrid;i++){
+            k_x[i] = (2.*i - (Ngrid-1) - 1.)/(2.*(Ngrid-1)) * M_PI*PROFILE::RBZ_x;	// (something)*(a length of the range)
+            k_y[i] = (2.*i - (Ngrid-1) - 1.)/(2.*(Ngrid-1)) * M_PI*PROFILE::RBZ_y;
+        }
+    }
+
+    inline int get_L() const { return L; }
+    inline ChernNumber& operator=(const ChernNumber &Copy) { return *this; }
+
+    double FHS_method(const int n, const int m, const int ranks, const int nprocs)
+    {
+        set_list_eigenvec();
+        MPIERR(MPI_Barrier(MPI_COMM_WORLD));
+
+        double Pchern = 0, chern = 0;
+
+        for(int i=ranks;i<Ngrid*Ngrid;i+=nprocs){
+            int x = i%Ngrid, x_ = (x+1)%Ngrid;
+            int y = (int)(i/Ngrid), y_ = (y+1)%Ngrid;
+
+            dcomplex bcArray1 = berry_connection(i, y*Ngrid+x_, n, m),
+                bcArray2 = berry_connection(y*Ngrid+x_, y_*Ngrid+x_, n, m),
+                bcArray3 = berry_connection(y_*Ngrid+x, y_*Ngrid+x_, n, m),
+                bcArray4 = berry_connection(i, y_*Ngrid+x, n, m);
+
+            dcomplex bc1 = bcArray1/std::abs(bcArray1),
+                bc2 = bcArray2/std::abs(bcArray2),
+                bc3 = bcArray3/std::abs(bcArray3),
+                bc4 = bcArray4/std::abs(bcArray4);
+
+            Pchern += std::log(bc1*bc2/(bc3*bc4)).imag();
+        }
+	    MPIERR(MPI_Barrier(MPI_COMM_WORLD));
+
+        MPIERR(MPI_Reduce(&Pchern,&chern,1,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD));
+
+        if(ranks==0){
+            chern = chern/(M_PI*PROFILE::RBZ_x);
+        }
+        MPIERR(MPI_Bcast(&chern,1,MPI_DOUBLE,0,MPI_COMM_WORLD));
+
+        return chern;
+    }
+};
+
+
+namespace FiniteT
+{
+
+template <typename EIGEN>
+class Equations
+{
+    EIGEN eigen;
+    const int L,L2;
+    const double beta;
+public:
+    Equations(const EIGEN &Eigen, const int size, const double beta):
+    eigen(Eigen),
+    L(size), L2(size*2),
+    beta(beta)
+    {}
+
+    void Gap_Num_eq(const double k_x, const double k_y, double * gaps, double * nums, double c, const std::vector<double> m, const std::vector<double> d)
+    {
+        const bool IsNotDev = true;
+        MatrixC BdG(L2); double E[L2]; 
+        eigen.Quasi(k_x,k_y,m,d,E,BdG,'V',IsNotDev);
+
+        for (int i = 0; i < L; ++i)
+        {
+            std::vector<dcomplex> u(L), ubeta(L);
+            std::vector<dcomplex> v(L), vbeta(L);
+            
+            std::copy(&BdG[L2*i],&BdG[L2*i+L],&u[0]);
+            std::copy(&BdG[L2*(L+i)],&BdG[L2*(L+i)+L],&v[0]);
+
+            for (int n=0; n<L; ++n) {
+                double tanh_beta = tanh(beta*E[n]/2);
+                ubeta[n] = u[n]*tanh_beta;
+                vbeta[n] = v[n]*tanh_beta;
+            }
+            
+            dcomplex temp1 = -arrmul(u,ubeta) + arrmul(v,vbeta) + dcomplex(1.0,0);
+            nums[i] += temp1.real()*c;
+        
+            dcomplex temp2 = -arrmul(u,vbeta)-arrmul(v,ubeta);
+            gaps[i] += temp2.real()*c; 		
+        }
+    }
+
+    void Num_eq(const double k_x, const double k_y, double * nums, double c, const std::vector<double> m, const std::vector<double> d)
+    {
+        const bool IsNotDev = true;
+        MatrixC BdG(L2); double E[L2]; 
+        eigen.Quasi(k_x,k_y,m,d,E,BdG,'V',IsNotDev);
+
+        for (int k = 0; k < L; k++)
+        {
+            std::vector<dcomplex> u(L), ubeta(L);
+            std::vector<dcomplex> v(L), vbeta(L);
+            
+            std::copy(&BdG[L2*k],&BdG[L2*k+L],&u[0]);
+            std::copy(&BdG[L2*(L+k)],&BdG[L2*(L+k)+L],&v[0]);
+
+            for (int n=0; n<L; ++n) {
+                double tanh_beta = tanh(beta*E[n]/2);
+                ubeta[n] = u[n]*tanh_beta;
+                vbeta[n] = v[n]*tanh_beta;
+            }
+
+            dcomplex temp = -arrmul(u,ubeta) + arrmul(v,vbeta) + dcomplex(1.0,0);
+            nums[k] += temp.real()*c;
+        };
+    }
+
+    void Gap_eq(const double k_x, const double k_y, double * gaps, double c, const std::vector<double> m, const std::vector<double> d)
+    {	
+        const bool IsNotDev = true;
+        MatrixC BdG(L2); double E[L2];
+        eigen.Quasi(k_x,k_y,m,d,E,BdG,'V',IsNotDev);
+        
+        for(int i = 0; i < L; i++){
+            std::vector<dcomplex> u(L), ubeta(L);
+            std::vector<dcomplex> v(L), vbeta(L);
+
+            std::copy(&BdG[L2*i],&BdG[L2*i+L],&u[0]);
+            std::copy(&BdG[L2*(L+i)],&BdG[L2*(L+i)+L],&v[0]);
+
+            for (int n=0; n<L; ++n) {
+                double tanh_beta = tanh(beta*E[n]/2);
+                ubeta[n] = u[n]*tanh_beta;
+                vbeta[n] = v[n]*tanh_beta;
+            }
+
+            dcomplex temp = -arrmul(u,vbeta)-arrmul(v,ubeta);
+            gaps[i] += temp.real()*c; 		
+        }
+    }
+
+    double W_eq(const double k_x, const double k_y, const std::vector<double> m, const std::vector<double> d, const std::vector<double> &dilute, const double m0)
+    {
+        const bool IsNotDev = true, IsTranspose = false;
+        double result = 0;
+        MatrixC BdG(L2); 
+        double E[L2]; 
+        eigen.Quasi(k_x,k_y,m,d,E,BdG,'N',IsNotDev,IsTranspose);
+        
+        for(int i = 0; i < L; i++){
+            double cosh_beta = cosh(beta*E[i]/2); 
+            result += -log(4*cosh_beta*cosh_beta)/beta-m[i]+d[i]*d[i]/dilute[i]+(m[i]-m0)*(m[i]-m0)/dilute[i];
+        }
+
+        return result;
+    }
+
+    double W_eq(const double k_x, const double k_y, const std::vector<double> m, const std::vector<double> d, const double U, const double m0)
+    {
+        const bool IsNotDev = true, IsTranspose = false;
+        double result = 0;
+        MatrixC BdG(L2); 
+        double E[L2]; 
+        eigen.Quasi(k_x,k_y,m,d,E,BdG,'N',IsNotDev,IsTranspose);
+        
+        for(int i = 0; i < L; i++){ 
+            double cosh_beta = cosh(beta*E[i]/2); 
+            result += -log(4*cosh_beta*cosh_beta)/beta-m[i]+d[i]*d[i]/U+(m[i]-m0)*(m[i]-m0)/U;
+        }
+
+        return result;
+    }
+
+    std::pair<double,double> SFW_eq(const double k_x, const double k_y, const std::vector<double> m, const std::vector<double> d, const double V)
+    {
+        const bool IsTranspose = false;
+        MatrixC g_T(L), g(L), BdG(L2), Psi(L2), G_T(L2);
+        double e[L], E[L2];
+
+        eigen.Single(k_x,k_y,e,g_T,'V',true,IsTranspose);
+        eigen.Quasi(k_x,k_y,m,d,E,Psi,'V',true);
+
+        g = g_T.Hermitian_transpose();
+        G_T.put_Block(g_T,0,L,0,L);
+        G_T.put_Block(g_T,L,L2,L,L2);
+        BdG = G_T.zgemm(1.0,Psi);
+
+        MatrixC dh(L);
+        eigen.Make_dH0(k_x,k_y,dh);
+        MatrixC g_dh_g = (g_T.zgemm(1.0,dh)).zgemm(1.0,g);
+
+        MatrixC M_conv(L2), M_geom(L2);
+        dcomplex SFW_conv=0, SFW_geom=0;
+
+        for (int idx=0;idx<L2*L2;++idx){
+            int i=idx/L2, j=idx%L2;
+            dcomplex M_conv_p=0, M_conv_m=0;
+            dcomplex M_geom_p=0, M_geom_m=0;
+            
+            for(int m=0;m<L;m++)
+            for(int n=0;n<L;n++){
+                if(m==n){ M_conv_p += std::conj(BdG(m,i))*BdG(n,j)*g_dh_g(m,n); }
+                else{ M_geom_p += std::conj(BdG(m,i))*BdG(n,j)*g_dh_g(m,n); }
+            }
+
+            for(int q=L;q<L2;q++)
+            for(int p=L;p<L2;p++){
+                if(p==q){ M_conv_m += std::conj(BdG(q,j))*BdG(p,i)*g_dh_g(q-L,p-L); }
+                else{ M_geom_m += std::conj(BdG(q,j))*BdG(p,i)*g_dh_g(q-L,p-L); }
+            }
+
+            //M_conv(i,j) = M_conv_p*M_conv_m+M_conv_p*M_geom_m+M_geom_p*M_conv_m; 
+            //M_geom(i,j) = M_geom_p*M_geom_m; 
+            M_conv(i,j) = M_conv_p*M_conv_m; 
+            M_geom(i,j) = M_geom_p*M_geom_m+M_conv_p*M_geom_m+M_geom_p*M_conv_m; 
+        }
+
+    	for(int i=0;i<L;i++)
+        {
+            double coef1 = beta/(2.0*std::pow(std::cosh(beta*E[L2-1-i]/2.0),2))*-4.0,
+                coef2 = std::tanh(beta*E[L2-1-i]/2.)/E[L2-1-i]*-2.0;
+            SFW_conv += coef1*M_conv(i,i)+coef2*(M_conv(L2-1-i,i)+M_conv(i,L2-1-i));	
+            SFW_geom += coef1*M_geom(i,i)+coef2*(M_geom(L2-1-i,i)+M_geom(i,L2-1-i));
+
+            for(int j=i+1;j<L;j++)
+            {
+                double coef3 = (std::tanh(beta*E[L2-1-i]/2.)+std::tanh(beta*E[L2-1-j]/2.))/(E[L2-1-i]+E[L2-1-j])*-2.0,
+                    coef4 = (std::tanh(beta*E[L+i]/2.)+std::tanh(beta*E[L+j]/2.))/(E[L+i]+E[L+j])*-2.0;
+                SFW_conv += coef3*(M_conv(i,L2-1-j)+M_conv(L2-1-j,i))+coef4*(M_conv(L-1-i,L+j)+M_conv(L+j,L-1-i));
+                SFW_geom += coef3*(M_geom(i,L2-1-j)+M_geom(L2-1-j,i))+coef4*(M_geom(L-1-i,L+j)+M_geom(L+j,L-1-i));
+
+                double coef5 = (1/(1+exp(-beta*E[L2-1-j]))-1/(1+exp(-beta*E[L2-1-i])))/(-E[L2-1-i]+E[L2-1-j])*-4.0,
+                    coef6 = (1/(1+exp(beta*E[L+j]))-1/(1+exp(beta*E[L+i])))/(E[L+i]-E[L+j])*-4.0;
+                SFW_conv += coef5*(M_conv(i,j)+M_conv(j,i)) + coef6*(M_conv(L+i,L+j)+M_conv(L+j,L+i));
+                SFW_geom += coef5*(M_geom(i,j)+M_geom(j,i)) + coef6*(M_geom(L+i,L+j)+M_geom(L+j,L+i));
+            } 
+        }
+
+        return std::pair<double,double>(std::real(SFW_conv)/V,std::real(SFW_geom)/V);
+    }
+};
+
+
+template <typename EIGEN, typename PROFILE>
+class Gauss : public Equations<EIGEN>
+{
+    const int Ngrid, L, L2;
+    std::vector<double> k_x, k_y, xg, wg;
+    const double kx_intv[2], ky_intv[2], RBZarea, beta;
+public:
+    Gauss(const EIGEN &eigen, const int size, const double beta, const int Ngrid):
+    Equations<EIGEN>(eigen, size, beta),
+    Ngrid(Ngrid),
+    L(size), L2(size*2),
+    beta(beta),
+    RBZarea(M_PI*M_PI*PROFILE::RBZ_x*PROFILE::RBZ_y),
+    kx_intv{-M_PI/2.*PROFILE::RBZ_x,M_PI/2.*PROFILE::RBZ_x},
+    ky_intv{-M_PI/2.*PROFILE::RBZ_y,M_PI/2.*PROFILE::RBZ_y}
+    {
+        k_x.resize(Ngrid);
+        k_y.resize(Ngrid);
+        GaussLobattoPoints(Ngrid,xg,wg);
+
+        for(int i=0;i<Ngrid;i++){
+            k_x[i] = (kx_intv[0]+kx_intv[1])/2.+(kx_intv[1]-kx_intv[0])*xg[i]/2.;
+            k_y[i] = (ky_intv[0]+ky_intv[1])/2.+(ky_intv[1]-ky_intv[0])*xg[i]/2.;
+        }
+    }
+
+    inline int get_L() const { return L; }
+    inline Gauss& operator=(const Gauss &Copy) { return *this; }
+
+    void Gap_Num (const std::vector<double> m, const std::vector<double> d, double * gaps, double * nums, const int ranks, const int nprocs)
+    {
+        std::vector<double> Pgaps(L,0), Pnums(L,0);
+
+        for(int i=ranks;i<Ngrid*Ngrid;i+=nprocs){
+            int x = i%Ngrid;
+            int y = (int)(i/Ngrid);
+            this->Gap_Num_eq(k_x[x],k_y[y],&Pgaps[0],&Pnums[0],(ky_intv[1]-ky_intv[0])*wg[y]/2.*(kx_intv[1]-kx_intv[0])*wg[x]/2.,m,d);
+        }
+	    MPIERR(MPI_Barrier(MPI_COMM_WORLD));
+
+        MPIERR(MPI_Reduce(&Pgaps[0],&gaps[0],L,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD));
+        MPIERR(MPI_Reduce(&Pnums[0],&nums[0],L,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD));
+
+        if(ranks==0){
+            for(int i=0;i<L;i++){ 
+                gaps[i] = gaps[i]/RBZarea;
+                nums[i] = nums[i]/RBZarea;
+		    }
+        }
+
+        MPIERR(MPI_Bcast(&gaps[0],L,MPI_DOUBLE,0,MPI_COMM_WORLD));
+        MPIERR(MPI_Bcast(&nums[0],L,MPI_DOUBLE,0,MPI_COMM_WORLD));
+    }
+
+    void Num (const std::vector<double> m, const std::vector<double> d, double * nums, const int ranks, const int nprocs)
+    {
+        std::vector<double> Pnums(L,0);
+
+        for(int i=ranks;i<Ngrid*Ngrid;i+=nprocs){
+            int x = i%Ngrid;
+            int y = (int)(i/Ngrid);
+            this->Num_eq(k_x[x],k_y[y],&Pnums[0],(ky_intv[1]-ky_intv[0])*wg[y]/2.*(kx_intv[1]-kx_intv[0])*wg[x]/2.,m,d);
+        }
+	    MPIERR(MPI_Barrier(MPI_COMM_WORLD));
+
+        MPIERR(MPI_Reduce(&Pnums[0],&nums[0],L,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD));
+
+        if(ranks==0){
+            for(int i=0;i<L;i++){ 
+                nums[i] = nums[i]/RBZarea;
+		    }
+        }
+
+        MPIERR(MPI_Bcast(&nums[0],L,MPI_DOUBLE,0,MPI_COMM_WORLD));
+    }
+
+    void Gap (const std::vector<double> m, const std::vector<double> d, double * gaps, const int ranks, const int nprocs) 
+    {
+        std::vector<double> Pgaps(L,0);
+
+        for(int i=ranks;i<Ngrid*Ngrid;i+=nprocs){
+            int x = i%Ngrid;
+            int y = (int)(i/Ngrid);
+            this->Gap_eq(k_x[x],k_y[y],&Pgaps[0],(ky_intv[1]-ky_intv[0])*wg[y]/2.*(kx_intv[1]-kx_intv[0])*wg[x]/2.,m,d);
+        }
+	    MPIERR(MPI_Barrier(MPI_COMM_WORLD));
+
+        MPIERR(MPI_Reduce(&Pgaps[0],&gaps[0],L,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD));
+
+        if(ranks==0){
+            for(int i=0;i<L;i++){ 
+                gaps[i] = gaps[i]/RBZarea;
+		    }
+        }
+
+        MPIERR(MPI_Bcast(&gaps[0],L,MPI_DOUBLE,0,MPI_COMM_WORLD));
+    }
+
+    double W (const std::vector<double> m, const std::vector<double> d, const std::vector<double> &dilute, const double m0, const int ranks, const int nprocs)
+    {
+        double Presult=0,result=0;
+
+        for(int i=ranks;i<Ngrid*Ngrid;i+=nprocs){
+            int x = i%Ngrid;
+            int y = (int)(i/Ngrid);
+
+		    double weight = (ky_intv[1]-ky_intv[0])*wg[y]/2.*(kx_intv[1]-kx_intv[0])*wg[x]/2.;
+            Presult += this->W_eq(k_x[x],k_y[y],m,d,dilute,m0)*weight;
+        }
+
+        MPIERR(MPI_Reduce(&Presult,&result,1,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD));
+
+        if(ranks==0){
+            result = result/RBZarea;
+        }
+
+        MPIERR(MPI_Bcast(&result,1,MPI_DOUBLE,0,MPI_COMM_WORLD));
+
+        return result;
+    }
+
+    double W (const std::vector<double> m, const std::vector<double> d, const double U, const double m0, const int ranks, const int nprocs)
+    {
+        double Presult=0,result=0;
+
+        for(int i=ranks;i<Ngrid*Ngrid;i+=nprocs){
+            int x = i%Ngrid;
+            int y = (int)(i/Ngrid);
+
+		    double weight = (ky_intv[1]-ky_intv[0])*wg[y]/2.*(kx_intv[1]-kx_intv[0])*wg[x]/2.;
+            Presult += this->W_eq(k_x[x],k_y[y],m,d,U,m0)*weight;
+        }
+
+        MPIERR(MPI_Reduce(&Presult,&result,1,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD));
+
+        if(ranks==0){
+            result = result/RBZarea;
+        }
+
+        MPIERR(MPI_Bcast(&result,1,MPI_DOUBLE,0,MPI_COMM_WORLD));
+
+        return result;
+    }
+
+    std::pair<double,double> SFW (const std::vector<double> m, const std::vector<double> d, const double V, const int ranks, const int nprocs)
+    {
+        std::vector<double> Presult(2,0), result(2,0);
+
+        for(int i=ranks;i<Ngrid*Ngrid;i+=nprocs){
+            int x = i%Ngrid;
+            int y = (int)(i/Ngrid);
+
+		    double weight = (ky_intv[1]-ky_intv[0])*wg[y]/2.*(kx_intv[1]-kx_intv[0])*wg[x]/2.;
+            std::pair<double,double> sfw = this->SFW_eq(k_x[x],k_y[y],m,d,V);
+            Presult[0] += sfw.first*weight;
+            Presult[1] += sfw.second*weight;
+        }
+
+        MPIERR(MPI_Reduce(&Presult[0],&result[0],2,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD));
+
+        if(ranks==0){
+            result[0] = result[0]/RBZarea;
+            result[1] = result[1]/RBZarea;
+        }
+
+        MPIERR(MPI_Bcast(&result[0],2,MPI_DOUBLE,0,MPI_COMM_WORLD));
+
+        return std::pair<double,double>(result[0],result[1]);
+    }
+};
+
+} // namespace FiniteT
+
+namespace OneDimension
+{
+
+template <typename EIGEN>
+class Equations
+{
+    EIGEN eigen;
+    const int L,L2;
+public:
+    Equations(const EIGEN &Eigen, const int size):
+    eigen(Eigen),
+    L(size), L2(size*2)
+    {}
+
+    void Gap_Num_eq(const double k, double * gaps, double * nums, double c, const std::vector<double> m, const std::vector<double> d)
+    {
+        const bool IsNotDev = true;
+        MatrixC BdG(L2); double E[L2]; 
+        eigen.Quasi(k,m,d,E,BdG,'V',IsNotDev);
+
+        for (int i = 0; i < L; ++i)
+        {
+            std::vector<dcomplex> u(L);
+            std::vector<dcomplex> v(L);
+            
+            std::copy(&BdG[L2*i],&BdG[L2*i+L],&u[0]);
+            std::copy(&BdG[L2*(L+i)],&BdG[L2*(L+i)+L],&v[0]);
+            
+            dcomplex temp1 = arrmul(u,u) - arrmul(v,v) + dcomplex(1.0,0);
+            nums[i] += temp1.real()*c;
+        
+            dcomplex temp2 = arrmul(u,v)+arrmul(v,u);
+            gaps[i] += temp2.real()*c; 		
+        }
+    }
+
+    void Num_eq(const double k, double * nums, double c, const std::vector<double> m, const std::vector<double> d)
+    {
+        const bool IsNotDev = true;
+        MatrixC BdG(L2); double E[L2]; 
+        eigen.Quasi(k,m,d,E,BdG,'V',IsNotDev);
+
+        for (int i = 0; i < L; i++)
+        {
+            std::vector<dcomplex> u(L);
+            std::vector<dcomplex> v(L);
+            
+            std::copy(&BdG[L2*i],&BdG[L2*i+L],&u[0]);
+            std::copy(&BdG[L2*(L+i)],&BdG[L2*(L+i)+L],&v[0]);
+            dcomplex temp = arrmul(u,u) - arrmul(v,v) + dcomplex(1.0,0);
+            nums[i] += temp.real()*c;
+        };
+    }
+
+    void Gap_eq(const double k, double * gaps, double c, const std::vector<double> m, const std::vector<double> d)
+    {	
+        const bool IsNotDev = true;
+        MatrixC BdG(L2); double E[L2];
+        eigen.Quasi(k,m,d,E,BdG,'V',IsNotDev);
+        
+        for(int i = 0; i < L; i++){
+            std::vector<dcomplex> u(L);
+            std::vector<dcomplex> v(L);
+            std::copy(&BdG[L2*i],&BdG[L2*i+L],&u[0]);
+            std::copy(&BdG[L2*(L+i)],&BdG[L2*(L+i)+L],&v[0]);
+            dcomplex temp = arrmul(u,v)+arrmul(v,u);
+            gaps[i] += temp.real()*c; 		
+        }
+    }
+
+    double W_eq(const double k, const std::vector<double> m, const std::vector<double> d, const std::vector<double> &dilute, const double m0)
+    {
+        const bool IsNotDev = true, IsTranspose = false;
+        double result = 0;
+        MatrixC BdG(L2); 
+        double E[L2]; 
+        eigen.Quasi(k,m,d,E,BdG,'N',IsNotDev,IsTranspose);
+        
+        for(int i = 0; i < L; i++){ 
+            result += E[i]-m[i]+d[i]*d[i]/dilute[i]+(m[i]-m0)*(m[i]-m0)/dilute[i];
+        }
+
+        return result;
+    }
+
+    double W_eq(const double k, const std::vector<double> m, const std::vector<double> d, const double U, const double m0)
+    {
+        const bool IsNotDev = true, IsTranspose = false;
+        double result = 0;
+        MatrixC BdG(L2); 
+        double E[L2]; 
+        eigen.Quasi(k,m,d,E,BdG,'N',IsNotDev,IsTranspose);
+        
+        for(int i = 0; i < L; i++){ 
+            result += E[i]-m[i]+d[i]*d[i]/U+(m[i]-m0)*(m[i]-m0)/U;
+        }
+
+        return result;
+    }
+
+    std::pair<double,double> SFW_eq(const double k, const std::vector<double> m, const std::vector<double> d, const double V, const double beta)
+    {
+        const bool IsTranspose = false;
+        MatrixC g_T(L), g(L), BdG(L2), Psi(L2), G_T(L2);
+        double e[L], E[L2];
+
+        eigen.Single(k,e,g_T,'V',true,IsTranspose);
+        eigen.Quasi(k,m,d,E,Psi,'V',true);
+
+        g = g_T.Hermitian_transpose();
+        G_T.put_Block(g_T,0,L,0,L);
+        G_T.put_Block(g_T,L,L2,L,L2);
+        BdG = G_T.zgemm(1.0,Psi);
+
+        MatrixC dh(L);
+        eigen.Make_dH0(k,dh);
+        MatrixC g_dh_g = (g_T.zgemm(1.0,dh)).zgemm(1.0,g);
+
+        MatrixC M_conv(L2), M_geom(L2);
+        dcomplex SFW_conv=0, SFW_geom=0;
+
+        for (int idx=0;idx<L2*L2;++idx){
+            int i=idx/L2, j=idx%L2;
+            dcomplex M_conv_p=0, M_conv_m=0;
+            dcomplex M_geom_p=0, M_geom_m=0;
+            
+            for(int m=0;m<L;m++)
+            for(int n=0;n<L;n++){
+                if(m==n){ M_conv_p += std::conj(BdG(m,i))*BdG(n,j)*g_dh_g(m,n); }
+                else{ M_geom_p += std::conj(BdG(m,i))*BdG(n,j)*g_dh_g(m,n); }
+            }
+
+            for(int q=L;q<L2;q++)
+            for(int p=L;p<L2;p++){
+                if(p==q){ M_conv_m += std::conj(BdG(q,j))*BdG(p,i)*g_dh_g(q-L,p-L); }
+                else{ M_geom_m += std::conj(BdG(q,j))*BdG(p,i)*g_dh_g(q-L,p-L); }
+            }
+
+            //M_conv(i,j) = M_conv_p*M_conv_m+M_conv_p*M_geom_m+M_geom_p*M_conv_m; 
+            //M_geom(i,j) = M_geom_p*M_geom_m; 
+            M_conv(i,j) = M_conv_p*M_conv_m; 
+            M_geom(i,j) = M_geom_p*M_geom_m+M_conv_p*M_geom_m+M_geom_p*M_conv_m; 
+        }
+
+    	for(int i=0;i<L;i++)
+        {
+            double coef1 = beta/(2.0*std::pow(std::cosh(beta*E[L2-1-i]/2.0),2))*-4.0,
+                coef2 = std::tanh(beta*E[L2-1-i]/2.)/E[L2-1-i]*-2.0;
+            SFW_conv += coef1*M_conv(i,i)+coef2*(M_conv(L2-1-i,i)+M_conv(i,L2-1-i));	
+            SFW_geom += coef1*M_geom(i,i)+coef2*(M_geom(L2-1-i,i)+M_geom(i,L2-1-i));
+            for(int j=i+1;j<L;j++)
+            {
+                double coef3 = (std::tanh(beta*E[L2-1-i]/2.)+std::tanh(beta*E[L2-1-j]/2.))/(E[L2-1-i]+E[L2-1-j])*-2.0,
+                    coef4 = (std::tanh(beta*E[L+i]/2.)+std::tanh(beta*E[L+j]/2.))/(E[L+i]+E[L+j])*-2.0;
+                SFW_conv += coef3*(M_conv(i,L2-1-j)+M_conv(L2-1-j,i))+coef4*(M_conv(L-1-i,L+j)+M_conv(L+j,L-1-i));
+                SFW_geom += coef3*(M_geom(i,L2-1-j)+M_geom(L2-1-j,i))+coef4*(M_geom(L-1-i,L+j)+M_geom(L+j,L-1-i));
+            }
+        }
+
+        return std::pair<double,double>(std::real(SFW_conv)/V,std::real(SFW_geom)/V);
+    }
+};
+
+template <typename EIGEN, typename PROFILE>
+class Gauss : public Equations<EIGEN>
+{
+    const int Ngrid, L, L2;
+    std::vector<double> k, xg, wg;
+    const double k_intv[2], RBZarea;
+public:
+    Gauss(const EIGEN &eigen, const int size, const int Ngrid):
+    Equations<EIGEN>(eigen, size),
+    Ngrid(Ngrid),
+    k_intv{-M_PI/2.*PROFILE::RBZ,M_PI/2.*PROFILE::RBZ},
+    L(size), L2(size*2),
+    RBZarea(M_PI*PROFILE::RBZ)
+    {
+        k.resize(Ngrid);
+        GaussLobattoPoints(Ngrid,xg,wg);
+
+        for(int i=0;i<Ngrid;i++){
+            k[i] = (k_intv[0]+k_intv[1])/2.+(k_intv[1]-k_intv[0])*xg[i]/2.;
+        }
+    }
+
+    inline int get_L() const { return L; }
+    inline Gauss& operator=(const Gauss &Copy) { return *this; }
+
+    void Gap_Num (const std::vector<double> m, const std::vector<double> d, double * gaps, double * nums, const int ranks, const int nprocs)
+    {
+        std::vector<double> Pgaps(L,0), Pnums(L,0);
+
+        for(int x=ranks;x<Ngrid;x+=nprocs){
+            this->Gap_Num_eq(k[x],&Pgaps[0],&Pnums[0],(k_intv[1]-k_intv[0])*wg[x]/2.,m,d);
+        }
+	    MPIERR(MPI_Barrier(MPI_COMM_WORLD));
+
+        MPIERR(MPI_Reduce(&Pgaps[0],&gaps[0],L,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD));
+        MPIERR(MPI_Reduce(&Pnums[0],&nums[0],L,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD));
+
+        if(ranks==0){
+            for(int i=0;i<L;i++){ 
+                gaps[i] = gaps[i]/RBZarea;
+                nums[i] = nums[i]/RBZarea;
+		    }
+        }
+
+        MPIERR(MPI_Bcast(&gaps[0],L,MPI_DOUBLE,0,MPI_COMM_WORLD));
+        MPIERR(MPI_Bcast(&nums[0],L,MPI_DOUBLE,0,MPI_COMM_WORLD));
+    }
+
+    void Num (const std::vector<double> m, const std::vector<double> d, double * nums, const int ranks, const int nprocs)
+    {
+        std::vector<double> Pnums(L,0);
+
+        for(int x=ranks;x<Ngrid;x+=nprocs){
+            this->Num_eq(k[x],&Pnums[0],(k_intv[1]-k_intv[0])*wg[x]/2.,m,d);
+        }
+	    MPIERR(MPI_Barrier(MPI_COMM_WORLD));
+
+        MPIERR(MPI_Reduce(&Pnums[0],&nums[0],L,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD));
+
+        if(ranks==0){
+            for(int i=0;i<L;i++){ 
+                nums[i] = nums[i]/RBZarea;
+		    }
+        }
+
+        MPIERR(MPI_Bcast(&nums[0],L,MPI_DOUBLE,0,MPI_COMM_WORLD));
+    }
+
+    void Gap (const std::vector<double> m, const std::vector<double> d, double * gaps, const int ranks, const int nprocs) 
+    {
+        std::vector<double> Pgaps(L,0);
+
+        for(int x=ranks;x<Ngrid;x+=nprocs){
+            this->Gap_eq(k[x],&Pgaps[0],(k_intv[1]-k_intv[0])*wg[x]/2.,m,d);
+        }
+	    MPIERR(MPI_Barrier(MPI_COMM_WORLD));
+
+        MPIERR(MPI_Reduce(&Pgaps[0],&gaps[0],L,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD));
+
+        if(ranks==0){
+            for(int i=0;i<L;i++){ 
+                gaps[i] = gaps[i]/RBZarea;
+		    }
+        }
+
+        MPIERR(MPI_Bcast(&gaps[0],L,MPI_DOUBLE,0,MPI_COMM_WORLD));
+    }
+
+    double W (const std::vector<double> m, const std::vector<double> d, const std::vector<double> &dilute, const double m0, const int ranks, const int nprocs)
+    {
+        double Presult=0,result=0;
+
+        for(int x=ranks;x<Ngrid;x+=nprocs){
+		    double weight = (k_intv[1]-k_intv[0])*wg[x]/2.;
+            Presult += this->W_eq(k[x],m,d,dilute,m0)*weight;
+        }
+
+        MPIERR(MPI_Reduce(&Presult,&result,1,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD));
+
+        if(ranks==0){
+            result = result/RBZarea;
+        }
+
+        MPIERR(MPI_Bcast(&result,1,MPI_DOUBLE,0,MPI_COMM_WORLD));
+
+        return result;
+    }
+
+    double W (const std::vector<double> m, const std::vector<double> d, const double U, const double m0, const int ranks, const int nprocs)
+    {
+        double Presult=0,result=0;
+
+        for(int x=ranks;x<Ngrid;x+=nprocs){
+		    double weight = (k_intv[1]-k_intv[0])*wg[x]/2.;
+            Presult += this->W_eq(k[x],m,d,U,m0)*weight;
+        }
+
+        MPIERR(MPI_Reduce(&Presult,&result,1,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD));
+
+        if(ranks==0){
+            result = result/RBZarea;
+        }
+
+        MPIERR(MPI_Bcast(&result,1,MPI_DOUBLE,0,MPI_COMM_WORLD));
+
+        return result;
+    }
+
+    std::pair<double,double> SFW (const std::vector<double> m, const std::vector<double> d, const double V, const double beta, const int ranks, const int nprocs)
+    {
+        std::vector<double> Presult(2,0), result(2,0);
+
+        for(int x=ranks;x<Ngrid;x+=nprocs){
+		    double weight = (k_intv[1]-k_intv[0])*wg[x]/2.;
+            std::pair<double,double> sfw = this->SFW_eq(k[x],m,d,V,beta);
+            Presult[0] += sfw.first*weight;
+            Presult[1] += sfw.second*weight;
+        }
+
+        MPIERR(MPI_Reduce(&Presult[0],&result[0],2,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD));
+
+        if(ranks==0){
+            result[0] = result[0]/RBZarea;
+            result[1] = result[1]/RBZarea;
+        }
+
+        MPIERR(MPI_Bcast(&result[0],2,MPI_DOUBLE,0,MPI_COMM_WORLD));
+
+        return std::pair<double,double>(result[0],result[1]);
+    }
+};
+
+} // namespace OneDimension
 
 #endif
